@@ -2,6 +2,7 @@
 import numpy as np
 import random
 from tkinter import *
+import csv
 fields = 'Number of \'immediate\' class patients', 'Number of \'delayed\' class patients','Number of Ambulances', \
 'Number of Hospitals', 'Distance to Hospitals', 'Immediate Servers per Hospital', 'Delayed Servers per Hospital'
 
@@ -9,19 +10,19 @@ EMPTY = -1
 IMMEDIATE = 0           # magic number 0
 DELAYED = 1             # magic number 1
 BIG = 1.0e30            # magic number to set the initial delay so that it happens way after the first arrival
-RUNS = 210               # how many times we advance time
 
 # survival probability betas for shifted log logistic
 sll_pen_imm = [0.3510, 35.838, 1.9886]          # shifted log logistic for penetrative wounds, immediate class
 sll_pen_del = [0.9124, 213.5976, 2.3445]        # shifted log logistic for penetrative wounds, delayed class
+immalpha = -0.0207
+delalpha = -0.0038
 
-num_imm = 20
-num_del = 50
-num_ams = 5
-num_hos = 3
-hospital_distances = [5, 10, 20]
-imm_arr = [1, 2, 3]
-del_arr = [6, 8, 10]
+# mandalay bay test
+# immediate patients: uniform(10-40)% of uniform(200-250) total patients
+# hospital distances: 5.59, 4.24, 6.95
+# hospital imm servers: 6, 5, 0
+# hospital del servers: 15, 12, 8
+# 30 ambulances
 
 """
 Ambulance Object
@@ -64,14 +65,13 @@ Time arrived at Service
 Time departing Service
 """
 class Patient(object):
-    def __init__(self, patient_type, hospital_number=-1, arrival_time=BIG, departure_time=BIG, _id=0):
+    def __init__(self, patient_type, hospital_number=-1, arrival_time=BIG, departure_time=BIG):
         self.patient_type = patient_type
         self.hospital_number = hospital_number
         self.arrival_time = arrival_time
         self.departure_time = departure_time
         self.survival_probability = 0.0
         self.location = 0               # 0 for not moved, 1 for ambulance, 2 for hospital, 3 for done
-        self._id = _id
 
 """
 Simulation Object
@@ -109,17 +109,20 @@ Patient Departure Event: Patient X departs Hospital Y
 """
 
 class Simulation:
-    def __init__(self, n_imm=20, n_del=50, n_ambs=5, n_hos=3, hos_dists=[5,10,20], imm_servers=[1,2,3], del_servers=[6,8,10], seed=12):
+    def __init__(self, n_imm=20, n_del=50, n_ambs=5, n_hos=3, hos_dists=[5,10,20], imm_servers=[1,2,3], del_servers=[6,8,10], selection="random", seed=12):
         random.seed(seed)
         
         # keeps track of time and our reward probability
         self.clock = 0.0
         self.total_survival_probability = 0.0
+        self.served = 0
+        self.limit = n_imm + n_del
         self.patients_picked_up = 0
+        self.selection = selection
         
         # keeps track of patients by location
-        self.imm_patients = [Patient(IMMEDIATE, _id=i) for i in range(n_imm)]
-        self.del_patients = [Patient(DELAYED, _id=-i) for i in range(n_del)]
+        self.imm_patients = [Patient(IMMEDIATE) for i in range(n_imm)]
+        self.del_patients = [Patient(DELAYED) for i in range(n_del)]
         self.scene_patients = self.imm_patients + self.del_patients
         self.amb_patients = []
         self.hos_patients = []
@@ -164,17 +167,17 @@ class Simulation:
         return hospital
     
     def generate_travel_time(self, distance):
-        return 1.5*distance
-        # return 60*np.random.lognormal(0.025*distance, 0.01*distance)
+        # return 1.5*distance
+        return 60*np.random.lognormal(0.025*distance, 0.01*distance)
     
     # define methods needed to run the simulation
     def generate_next_departure(self, patient_type):
         if patient_type == IMMEDIATE:
-            return 90
-            #return np.random.exponential(90)
+            #return 90
+            return np.random.exponential(90)
         else:
-            return 180
-            #return np.random.exponential(180)
+            #return 180
+            return np.random.exponential(180)
         
     # shifted log likelihood survival probability
     def sll_surv_prob(self, time, t_class):
@@ -198,42 +201,41 @@ class Simulation:
     Mu_j = mean service time
     Alpha = expected discount rate? Beta_1 in exponential (-.0207 for IMM, -0.0038 for DEL)
     """
-    def _select_patient(self, method="myopic"):
-        ptype = -1
-        hosnum = 0
-        
-        if method == "myopic":
-            imms = []
-            dels = []
-            for hospital in self.hospitals:
-                tau = self.generate_travel_time(hospital.distance)
-                x = self.patients_picked_up
-                immr = self.sll_surv_prob(self.clock+tau, IMMEDIATE)
-                delr = self.sll_surv_prob(self.clock+tau, DELAYED)
-                immb = hospital.servers_imm
-                delb = hospital.servers_del
-                immmu = self.generate_next_departure(IMMEDIATE)
-                delmu = self.generate_next_departure(DELAYED)
-                immalpha = -0.0207
-                delalpha = -0.0038
-                imms.append(tau * immr * (immmu/(immmu+immalpha)) * (immb*immmu/(immb*immmu+immalpha))**(x+1-immb))
-                dels.append(tau * delr * (delmu/(delmu+delalpha)) * (delb*delmu/(delb*delmu+delalpha))**(x+1-delb))
-            _argmaximm = self._argmax(imms)
-            _argmaxdel = self._argmax(dels)
-            if imms[_argmaximm] >= dels[_argmaxdel]:
-                ptype = IMMEDIATE
-                hosnum = _argmaximm
-            else:
-                ptype = DELAYED
-                hosnum = _argmaxdel
-        ptypes = [patient.patient_type for patient in self.scene_patients]
-        if (ptype in ptypes):
-            patient_num = ptypes.index(ptype)
+    def _myopic_reward(self, patient_type, hospital):
+        # separate by whether patient is immediate or delayed
+        tau = self.generate_travel_time(self.hospitals[hospital].distance)
+        x = self.patients_picked_up
+        if patient_type == IMMEDIATE:
+            immr = self.sll_surv_prob(self.clock+tau, IMMEDIATE)
+            immb = self.hospitals[hospital].servers_imm
+            immmu = self.clock + self.generate_next_departure(IMMEDIATE)
+            return (tau * immr * (immmu/(immmu+immalpha)) * (immb*immmu/(immb*immmu+immalpha))**(x+1-immb))
         else:
-            patient_num = ptypes.index(1-ptype)
-        _patient = self.scene_patients[patient_num]
-        _patient.hospital_number = hosnum
-        return _patient
+            delr = self.sll_surv_prob(self.clock+tau, DELAYED)
+            delb = self.hospitals[hospital].servers_del
+            delmu = self.clock + self.generate_next_departure(DELAYED)
+            return (tau * delr * (delmu/(delmu+delalpha)) * (delb*delmu/(delb*delmu+delalpha))**(x+1-delb))
+        
+    def _myopic(self):
+        # create pair patient_num, hospital by reward
+        _opt = [0,0]
+        _del = None
+        _imm = None
+        if DELAYED in [patient.patient_type for patient in self.scene_patients]:
+            _del = [patient.patient_type for patient in self.scene_patients].index(DELAYED)
+        if IMMEDIATE in [patient.patient_type for patient in self.scene_patients]:
+            _imm = [patient.patient_type for patient in self.scene_patients].index(IMMEDIATE)
+        if (_del is None):
+            assert _imm is not None
+        for hospital in range(len(self.hospitals)):
+            if self._myopic_reward(IMMEDIATE, _opt[1]) < self._myopic_reward(DELAYED, hospital) and _del is not None:
+                _opt[0] = _del
+                _opt[1] = hospital
+            elif _imm is not None:
+                _opt[0] = _imm
+                _opt[1] = hospital
+        self.scene_patients[_opt[0]].hospital_number = _opt[1]
+        return(_opt[0])
     
     """
     advance_time
@@ -242,32 +244,29 @@ class Simulation:
     
     def advance_time(self):
         # bookkeeping variables
-        #self.times = [self.next_ambulance_pickup_time, self.next_ambulance_dropoff_time, self.next_patient_departure_time]
-        #self.ambs_tracker = [ambulance.patient_type for ambulance in self.ambulances]
-        #self.patient_departures = [patient.departure_time for patient in self.patients]
-        #self.patient_arrivals = [patient.arrival_time for patient in self.patients]
-        #self.imm_q_tracker = [len(hospital.patients_imm) for hospital in self.hospitals]
-        #self.del_q_tracker = [len(hospital.patients_del) for hospital in self.hospitals]
+        if (self.served == self.limit):
+            return self.total_survival_probability
         next_time_step = min(self.next_ambulance_dropoff_time, self.next_ambulance_pickup_time, self.next_patient_departure_time)
-        if next_time_step == BIG:
-            return
+        #if next_time_step == BIG:
+            #print(self.__dict__)
+            #return self.total_survival_probability
         self.clock = next_time_step
         if next_time_step == self.next_ambulance_pickup_time:
             if len(self.scene_patients) > 0:
-                print("pickup event")
+                #print("pickup event")
                 self.pickup_event()
-                print([ambulance.pickup_time for ambulance in self.ambulances])
-                print([patient.hospital_number for patient in self.amb_patients])
+                #print([ambulance.pickup_time for ambulance in self.ambulances])
+                #print([patient.hospital_number for patient in self.amb_patients])
                 return
             else:
                 next_time_step = min(self.next_ambulance_dropoff_time, self.next_patient_departure_time)
         if next_time_step == self.next_ambulance_dropoff_time:
             if len(self.amb_patients) > 0:
-                print("dropoff event")
-                print([patient.arrival_time for patient in self.amb_patients])
-                print(self.next_patient_to_dropoff)
+                #print("dropoff event")
+                #print([patient.arrival_time for patient in self.amb_patients])
+                #print(self.next_patient_to_dropoff)
                 self.hospital_arrival_event()
-                print(self.next_patient_to_dropoff)
+                #print(self.next_patient_to_dropoff)
                 # print([patient.arrival_time for patient in self.hos_patients])
                 # print([ambulance.pickup_time for ambulance in self.ambulances])
                 return
@@ -275,9 +274,9 @@ class Simulation:
                 next_time_step = self.next_patient_departure_time
         if next_time_step == self.next_patient_departure_time:
             if len(self.hos_patients) > 0:
-                print("patient departure")
-                print([patient.departure_time for patient in self.hos_patients])
-                print(self.total_survival_probability)
+                #print("patient departure")
+                #print([patient.departure_time for patient in self.hos_patients])
+                #print(self.total_survival_probability, self.served)
                 self.patient_departure_event()
                 return
             else:
@@ -293,8 +292,15 @@ class Simulation:
     """
     def pickup_event(self):
         # grab variables/update patient
-        pnum = self._random_patient()
-        _patient = self.scene_patients[pnum]
+        if self.selection == "random":
+            pnum = self._random_patient()
+        elif self.selection == "myopic":
+            pnum = self._myopic()
+        elif self.selection == "last":
+            pnum = len(self.scene_patients)-1
+        elif self.selection == "first":
+            pnum = 0
+        #print(pnum)
         self.scene_patients[pnum].location = 1
         self.scene_patients[pnum].hospital_number = self._random_hospital()
         _hospital = self.hospitals[self.scene_patients[pnum].hospital_number]
@@ -326,7 +332,7 @@ class Simulation:
         
     def hospital_arrival_event(self):
         # grab patient/hospital/ambulance
-        _patient = self.next_patient_to_dropoff
+        #_patient = self.next_patient_to_dropoff
         self.amb_patients[self.next_patient_to_dropoff].location = 2
         _ambulance = self.next_ambulance_to_dropoff
         _hospital = self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number]
@@ -341,28 +347,28 @@ class Simulation:
             self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number].patients_imm += 1
             if self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number].patients_imm <= self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number].servers_imm:
                 self.amb_patients[self.next_patient_to_dropoff].departure_time = self.clock + self.generate_next_departure(self.amb_patients[self.next_patient_to_dropoff].patient_type)
-                self.amb_patients[self.next_patient_to_dropoff].survival_probability = self.sll_surv_prob(self.amb_patients[self.next_patient_to_dropoff].arrival_time, self.amb_patients[self.next_patient_to_dropoff].patient_type)
+                self.amb_patients[self.next_patient_to_dropoff].survival_probability = self.sll_surv_prob(self.clock, self.amb_patients[self.next_patient_to_dropoff].patient_type)
             self.total_survival_probability += self.amb_patients[self.next_patient_to_dropoff].survival_probability
         else:
             self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number].patients_del += 1
             if self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number].patients_del <= self.hospitals[self.amb_patients[self.next_patient_to_dropoff].hospital_number].servers_del:
                 self.amb_patients[self.next_patient_to_dropoff].departure_time = self.clock + self.generate_next_departure(self.amb_patients[self.next_patient_to_dropoff].patient_type)
-                self.amb_patients[self.next_patient_to_dropoff].survival_probability = self.sll_surv_prob(self.amb_patients[self.next_patient_to_dropoff].departure_time, self.amb_patients[self.next_patient_to_dropoff].patient_type)
+                self.amb_patients[self.next_patient_to_dropoff].survival_probability = self.sll_surv_prob(self.clock, self.amb_patients[self.next_patient_to_dropoff].patient_type)
             self.total_survival_probability += self.amb_patients[self.next_patient_to_dropoff].survival_probability
         
+        # update patient lists
+        self.hos_patients.append(self.amb_patients[self.next_patient_to_dropoff])
+        self.amb_patients.remove(self.amb_patients[self.next_patient_to_dropoff])
         # update global variables
         if len(self.amb_patients) > 0:
             self.next_patient_to_dropoff = self._argmin([patient.arrival_time for patient in self.amb_patients])
             self.next_ambulance_to_dropoff = self._argmin([ambulance.dropoff_time for ambulance in self.ambulances])
             self.next_ambulance_dropoff_time = self.ambulances[_ambulance].dropoff_time
         else:
-            self.amb_patients[self.next_patient_to_dropoff] = None
+            self.next_patient_to_dropoff = -1
             self.next_ambulance_to_dropoff = -1
             self.next_ambulance_dropoff_time = BIG
         
-        # update patient lists
-        self.hos_patients.append(self.amb_patients[self.next_patient_to_dropoff])
-        self.amb_patients.remove(self.amb_patients[self.next_patient_to_dropoff])
         # get the next ambulance pickup time
         if len(self.scene_patients) > 0:
             self.next_ambulance_to_pickup = self._argmin([ambulance.pickup_time for ambulance in self.ambulances])
@@ -372,16 +378,13 @@ class Simulation:
         self.next_patient_departure_time = self.hos_patients[self.next_patient_to_depart].departure_time
     
     def patient_departure_event(self):
-        # grab patient and hospital
-        _patient = self.hos_patients[self.next_patient_to_depart]
-        _hospital = self.hospitals[self.hos_patients[self.next_patient_to_depart].hospital_number]
-        
+        self.served += 1
         # update patient
         self.hos_patients[self.next_patient_to_depart].location = 3
         
         # update hospital
         if self.hos_patients[self.next_patient_to_depart].patient_type == IMMEDIATE:
-            self.hospitals[self.hos_patients[self.next_patient_to_depart].hospital_number].patients_imm -= 1
+            self.hospitals[self.hos_patients[self.next_patient_to_depart].hospital_number].patients_imm -= 1 
         else:
             self.hospitals[self.hos_patients[self.next_patient_to_depart].hospital_number].patients_del -= 1
         
@@ -399,16 +402,65 @@ class Simulation:
             if patient.patient_type == self.hos_patients[self.next_patient_to_depart].patient_type:
                 patient.departure_time = self.clock + self.generate_next_departure(patient.patient_type)
                 patient.survival_probability = self.sll_surv_prob(self.clock, patient.patient_type)
+                if (self.hos_patients[self.next_patient_to_depart].patient_type == IMMEDIATE):
+                    self.hospitals[self.hos_patients[self.next_patient_to_depart].hospital_number].patients_imm += 1
+                else:
+                    self.hospitals[self.hos_patients[self.next_patient_to_depart].hospital_number].patients_del -= 1
+                break
         
         # update global variables
         self.total_survival_probability += self.hos_patients[self.next_patient_to_depart].survival_probability
 
 def test(e):
     # assign all variables
-    s = Simulation(num_imm, num_del, num_ams, num_hos, hospital_distances, imm_arr, del_arr)
-    np.random.seed(0)
-    for i in range(RUNS):
-        s.advance_time()
+    # mandalay bay test
+    # immediate patients: uniform(10-40)% of uniform(200-250) total patients
+    # hospital distances: 5.59, 4.24, 6.95
+    # hospital imm servers: 6, 5, 0
+    # hospital del servers: 15, 12, 8
+    # 30 ambulances
+    num_ams = 30
+    num_hos = 3
+    hospital_distances = [5.59, 4.24, 6.95]
+    imm_arr = [6, 5, 0]
+    del_arr = [15, 12, 8]
+    obs = []
+    for i in range(100):
+        np.random.seed(i)
+        total_patients = np.random.randint(200, 251)
+        perc_imm = np.random.uniform(.1, .4)
+        num_imm = int(round(perc_imm*total_patients))
+        num_del = total_patients - num_imm
+        #selection = "random"
+        selection = "first"
+        #selection = "last"
+        #selection = "myopic"
+        s = Simulation(num_imm, num_del, num_ams, num_hos, hospital_distances, imm_arr, del_arr, selection)
+        for i in range(total_patients*3):
+            s.advance_time()
+            tup = [s.total_survival_probability, s.served, num_imm, num_del]
+        print(tup)
+        obs.append(tup)
+    if (selection == "myopic"):
+        with open('myopic.csv', 'w') as writeFile:
+            writer = csv.writer(writeFile)
+            writer.writerows(obs)
+        writeFile.close()
+    elif (selection == "random"):
+        with open('random.csv', 'w') as writeFile:
+            writer = csv.writer(writeFile)
+            writer.writerows(obs)
+        writeFile.close()
+    elif (selection == "first"):
+        with open('first.csv', 'w') as writeFile:
+            writer = csv.writer(writeFile)
+            writer.writerows(obs)
+        writeFile.close()
+    elif (selection == "last"):
+        with open('last.csv', 'w') as writeFile:
+            writer = csv.writer(writeFile)
+            writer.writerows(obs)
+        writeFile.close()
     return
 
 def instatiate(e,s):
@@ -459,6 +511,7 @@ def makeform(root, fields):
 
 if __name__ == '__main__':
     root = Tk()
+    root.winfo_toplevel().title("Emergency Room Simulator")
     ents = makeform(root, fields)
     root.bind('<Return>', (lambda event, e=ents: fetch(e)))
     s = Simulation()
@@ -471,6 +524,6 @@ if __name__ == '__main__':
     b3.pack(side=RIGHT, padx=5, pady=5)
     b4 = Button(root, text = 'Test', command = (lambda e=ents: test(e)))
     b4.pack(side=RIGHT, padx=5, pady=5)
-    b5 = Button(root, text = 'advance', command = (lambda e=ents: advance(s)))
+    b5 = Button(root, text = 'Advance', command = (lambda e=ents: advance(s)))
     b5.pack(side=RIGHT, padx=5, pady=5)
     root.mainloop()
